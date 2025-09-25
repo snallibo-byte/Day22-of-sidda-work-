@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""
+generate_ppt.py
+
+Create a 5-slide PowerPoint presentation from either:
+ - OpenAI (if OPENAI_API_KEY is set) by providing a topic
+ - Or from a local text file with slide content
+
+Usage examples:
+  # Use OpenAI to generate content (need OPENAI_API_KEY in env):
+  python generate_ppt.py --topic "Future of Electric Vehicles in India" --output ev_india.pptx
+
+  # Use local content file (format described below):
+  python generate_ppt.py --input slides.txt --output my_presentation.pptx
+"""
+
+import os
+import argparse
+import textwrap
+from pptx import Presentation
+from pptx.util import Inches, Pt
+
+# Optional import for OpenAI usage
+try:
+    import openai
+except Exception:
+    openai = None
+
+DEFAULT_MODEL = "gpt-3.5-turbo"  # change if you prefer another model
+
+
+def call_openai_generate(topic: str, model: str = DEFAULT_MODEL) -> list:
+    """
+    Return a list of 5 slides, each is a dict: {"title": str, "bullets": [str,...]}
+    Uses OpenAI ChatCompletion if api key present and openai package available.
+    If not available, raise RuntimeError.
+    """
+    if openai is None:
+        raise RuntimeError("OpenAI package not installed. Install with `pip install openai` or provide an input file.")
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY environment variable not set.")
+
+    openai.api_key = api_key
+
+    system_prompt = (
+        "You are an assistant that returns structured slide content. "
+        "Respond ONLY in JSON with an array named 'slides' of length 5. "
+        "Each slide must be an object with 'title' (string) and 'bullets' (array of 3 or 4 short strings). "
+        "Do not include any additional commentary."
+    )
+
+    user_prompt = (
+        f"Create a 5-slide presentation about: {topic}\n"
+        "For each slide, pick a clear title and provide 3-4 concise bullet points. "
+        "Tone: professional and optimistic. Keep bullets short (<=15 words)."
+    )
+
+    response = openai.ChatCompletion.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=700,
+    )
+
+    content = response["choices"][0]["message"]["content"].strip()
+
+    # Try to parse JSON from the response:
+    import json
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        # Try to find JSON substring
+        import re
+        m = re.search(r"\{.*\}", content, flags=re.S)
+        if not m:
+            raise RuntimeError("OpenAI response did not contain valid JSON.")
+        parsed = json.loads(m.group(0))
+
+    slides = parsed.get("slides")
+    if not slides or len(slides) != 5:
+        raise RuntimeError("Unexpected JSON format from OpenAI. 'slides' missing or not length 5.")
+
+    # Normalize bullets as list of strings
+    normalized = []
+    for slide in slides:
+        title = slide.get("title", "").strip()
+        bullets = slide.get("bullets", [])
+        if isinstance(bullets, str):
+            # maybe a single newline-delimited string
+            bullets = [b.strip() for b in bullets.splitlines() if b.strip()]
+        normalized.append({"title": title, "bullets": bullets[:4]})
+    return normalized
+
+
+def parse_input_file(path: str) -> list:
+    """
+    Parse a simple plain-text file into 5 slides.
+    Expected format:
+      Slide 1 Title
+      - bullet 1
+      - bullet 2
+      - bullet 3
+
+      Slide 2 Title
+      - bullet 1
+      ...
+    Slides separated by at least one blank line. Bullets start with '-' or '*'
+    """
+    text = open(path, encoding="utf-8").read()
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    slides = []
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        title = lines[0]
+        bullets = []
+        for ln in lines[1:]:
+            ln = ln.lstrip("-* ").strip()
+            if ln:
+                bullets.append(ln)
+        slides.append({"title": title, "bullets": bullets[:4]})
+        if len(slides) == 5:
+            break
+    if len(slides) != 5:
+        raise RuntimeError(f"Input file must contain 5 slides. Parsed {len(slides)}.")
+    return slides
+
+
+def build_presentation(slides: list, output_path: str):
+    prs = Presentation()
+    # Choose a simple title slide layout for first slide, others use title and content
+    title_slide_layout = prs.slide_layouts[0]  # usually Title Slide
+    body_layout = prs.slide_layouts[1]  # Title + Content
+
+    # If slides[0] is a real title slide, use different layout
+    first = slides[0]
+    slide = prs.slides.add_slide(title_slide_layout)
+    if first.get("title"):
+        title = slide.shapes.title
+        subtitle = slide.placeholders[1] if len(slide.placeholders) > 1 else None
+        title.text = first["title"]
+        if first.get("bullets"):
+            # put first bullet into subtitle as short description
+            subtitle.text = " • ".join(first["bullets"][:2]) if subtitle is not None else ""
+    # Add remaining slides (or all if first used as normal)
+    start_index = 1
+    for i in range(start_index, len(slides)):
+        s = slides[i]
+        slide = prs.slides.add_slide(body_layout)
+        slide.shapes.title.text = s.get("title", "")
+        # body placeholder index 1 typically
+        body = slide.shapes.placeholders[1].text_frame
+        body.clear()
+        body.word_wrap = True
+        # first bullet as paragraph; PPTX library requires paragraph objects
+        for j, bullet in enumerate(s.get("bullets", [])):
+            p = body.add_paragraph()
+            p.level = 0
+            p.font.size = Pt(18)
+            p.text = bullet
+
+    # If user provided exactly 5 slides and we used first as title, good.
+    # Save
+    prs.save(output_path)
+    print(f"Saved presentation to: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate a 5-slide PPTX from AI or file.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--topic", "-t", help="Topic to generate slides for (requires OPENAI_API_KEY & openai package).")
+    group.add_argument("--input", "-i", help="Path to input text file with 5 slide blocks.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="OpenAI model to use (if using --topic).")
+    parser.add_argument("--output", "-o", default="presentation.pptx", help="Output PPTX file name.")
+    args = parser.parse_args()
+
+    slides = None
+    if args.input:
+        slides = parse_input_file(args.input)
+    else:
+        try:
+            slides = call_openai_generate(args.topic, model=args.model)
+        except Exception as e:
+            print("Error generating with OpenAI:", str(e))
+            print("Falling back: creating 5 empty slides with topic as title.")
+            # simple fallback
+            slides = [{"title": args.topic, "bullets": [""]} for _ in range(5)]
+
+    # Ensure we have five slides; if not, pad
+    if len(slides) < 5:
+        while len(slides) < 5:
+            slides.append({"title": f"Slide {len(slides)+1}", "bullets": [""]})
+
+    build_presentation(slides, args.output)
+
+
+if __name__ == "__main__":
+    main()
